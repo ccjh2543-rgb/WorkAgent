@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SimpleAgent Web Console</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='48' fill='%2310b981'/><text x='50' y='68' font-size='48' text-anchor='middle' fill='white' font-family='sans-serif'>S</text></svg>">
+</head>
+<body>
+<div class="app">
+  <!-- 左侧栏 -->
+  <aside class="sidebar">
+    <div class="sb-brand">
+      <div class="sb-logo"><span>S</span></div>
+      <div>
+        <div class="name">SimpleAgent</div>
+        <div class="ver">本地 Web 控制台</div>
+      </div>
+    </div>
+
+    <div class="sb-nav">
+      <button id="btnNewConv" class="nav-item primary">
+        <span class="ico">＋</span> 新建任务
+      </button>
+    </div>
+
+    <div class="sb-groups">
+      <div class="sb-section">
+        <div class="sb-title">会话 <span id="convCount" class="count">0</span></div>
+        <div id="convList" class="sb-list"></div>
+      </div>
+
+      <div class="sb-section grow">
+        <div class="sb-title">当前分支 <span id="branchCount" class="count">0</span></div>
+        <div class="sb-hint" id="currentConvId">未选择会话</div>
+        <div id="branchList" class="sb-list"></div>
+      </div>
+
+      <div class="sb-section">
+        <div class="sb-title">工具 / 技能
+          <button id="btnShowSkills" class="chip">管理</button>
+        </div>
+        <div id="toolList" class="sb-list"></div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 主区 -->
+  <main class="main">
+    <header class="main-header">
+      <span id="connStatus" class="status">连接中…</span>
+      <div class="subhead">
+        <span>当前会话</span>
+        <span class="sep">/</span>
+        <span id="branchLabel" class="branch-label">未选择</span>
+      </div>
+      <div class="header-spacer"></div>
+      <div class="header-actions">
+        <button id="btnToggleEvents" class="chip">事件日志</button>
+        <button id="btnLogout" class="chip hidden">退出登录</button>
+      </div>
+    </header>
+
+    <div class="chat-wrap">
+      <div id="chat" class="chat"></div>
+    </div>
+
+    <div id="eventPanel" class="event-panel hidden">
+      <div class="event-head">
+        <span>实时事件日志</span>
+        <button id="btnClearEvents" class="chip">清空</button>
+      </div>
+      <div id="eventList" class="event-list"></div>
+    </div>
+
+    <div class="composer">
+      <div class="composer-box">
+        <textarea id="input" class="composer-textarea" rows="1"
+          placeholder="今天帮你做些什么？输入问题开始，或调用已注册的技能…" autocomplete="off"></textarea>
+        <div class="composer-toolbar">
+          <button class="tool-icon" id="btnAttach" title="上传附件（暂未启用）">📎</button>
+          <div class="toolbar-spacer"></div>
+          <span class="model-tag"><span class="pulse"></span> DeepSeek-V4-Flash</span>
+          <button id="btnStop" class="tool-icon hint-stop" title="停止本次执行">■</button>
+          <button id="btnSend" class="btn-send" title="发送">➤</button>
+        </div>
+      </div>
+      <div class="composer-actions">
+        <button id="btnRollback" class="chip">↩ 回滚到所选消息</button>
+        <button id="btnFork" class="chip">⑂ 从所选分叉</button>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- 登录验证 -->
+<div id="loginModal" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-title">访问验证</div>
+    <div class="modal-body">
+      <p>请输入启动服务时控制台打印的访问 Token。</p>
+      <input id="loginToken" class="input" type="password" placeholder="访问 Token" autocomplete="current-password">
+      <div id="loginErr" class="warn hidden"></div>
+    </div>
+    <div class="modal-actions">
+      <button id="btnLogin" class="btn primary">登录</button>
+    </div>
+  </div>
+</div>
+
+<!-- 审批弹窗 -->
+<div id="approvalModal" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-title" id="apprTitle">需要人工确认</div>
+    <div class="modal-body" id="apprBody"></div>
+    <div class="modal-fields">
+      <textarea id="apprText" class="textarea hidden" placeholder="…"></textarea>
+      <input id="apprReason" class="input hidden" type="text" placeholder="理由（可选）">
+    </div>
+    <div class="modal-actions">
+      <button id="apprApprove" class="btn primary">放行</button>
+      <button id="apprReject" class="btn danger">拒绝 / 收工</button>
+      <button id="apprModify" class="btn">修改后执行</button>
+    </div>
+  </div>
+</div>
+
+<!-- 技能管理弹窗 -->
+<div id="skillsModal" class="modal-mask hidden">
+  <div class="modal wide">
+    <div class="modal-title">技能管理</div>
+    <div class="modal-body">
+      <div id="skillsList" class="skills-list"></div>
+      <hr>
+      <div class="form-grid">
+        <input id="skName" class="input" placeholder="技能名（如 mycmd）">
+        <input id="skDesc" class="input" placeholder="给模型看的用途说明">
+        <input id="skCmd" class="input" placeholder="命令模板（{{args}} 为参数位）">
+        <button id="btnAddSkill" class="btn primary">新增技能</button>
+      </div>
+      <div class="warn">命令技能固定按最高风险注册，执行前必须人工确认；headless 模式默认禁止执行。</div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

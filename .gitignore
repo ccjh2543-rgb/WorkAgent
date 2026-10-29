@@ -1,0 +1,41 @@
+# 运行时状态与本地产物：一律不入库
+.simpleagent/
+/logs/
+/bin/
+.screenshots/
+llm_trace.jsonl
+*.pid
+*.exe
+*.exe~
+*.test
+*.out
+coverage.*
+
+# 仅忽略仓库根目录的运行日志：任务数据集里的 .log 属于输入数据，必须入库
+/*.log
+
+# 本机配置与凭据（禁止入库）
+.env
+.env.*
+
+# 编辑器与系统
+.trae/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Go 产物
+/vendor/
+
+# Python 缓存（遗留脚本目录）
+__pycache__/
+*.pyc
+
+# 文档与随手笔记：不入库（README 是唯一例外）
+*.md
+!README.md
+*.txt
+
+# 历史本地评测输出（非任务集；正式任务集来自外部 dataset 目录）
+/office_runs/
