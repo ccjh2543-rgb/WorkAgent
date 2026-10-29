@@ -9,7 +9,7 @@ llm_trace.jsonl
 *.exe~
 *.test
 *.out
-coverage.*
+/coverage.*
 
 # 仅忽略仓库根目录的运行日志：任务数据集里的 .log 属于输入数据，必须入库
 /*.log
