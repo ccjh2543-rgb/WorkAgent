@@ -84,7 +84,13 @@ go run ./interfaces/cli --bench run \
 
 # 查看历史运行
 go run ./interfaces/cli --bench report --run-id <RUN_ID>
+
+# 只校验任务集（不调用模型，秒级）
+go run ./interfaces/cli --bench validate --dataset <任务集目录>
 ```
+
+`--bench validate` 会在全量运行前确认“任务是否都能执行、是否存在静默跳过”：输出任务总数、可执行/不可执行数量及原因、
+产物类型需求，以及当前写能力不覆盖的类型（`--writable` 可覆盖默认能力集）。任一任务包不可执行时以非零码退出。
 
 Docker 执行器行为：
 

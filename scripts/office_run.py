@@ -28,11 +28,8 @@ import tarfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-# 这些后缀的 workspace 文件会被 read_file 当作二进制拒绝，故相关任务视为不可行。
-BINARY_EXT = re.compile(
-    r"\.(xlsx|pptx|pdf|docx|xls|ppt|doc|zip|png|jpg|jpeg|gif|bmp|ico|bin|pyc)$",
-    re.IGNORECASE,
-)
+# 说明：早期版本按后缀把 xlsx/pptx/pdf/docx 判定为“不可执行”并跳过。
+# Go 侧已支持四种格式读取，这里不再做后缀过滤，缺能力应在运行中显式失败。
 
 DEFAULT_TASKS = (
     r"F:\zhuomian\workbuddy-bench-main\datasets\wb-bench-office-v1.0\tasks"
@@ -41,23 +38,21 @@ DEFAULT_RUNS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "o
 DEFAULT_MODES = ["plan", "planner_worker"]
 
 
-def task_is_text_feasible(task_dir: Path) -> tuple[bool, list[str]]:
-    """根据 workspace 是否含二进制办公文件、以及 eval_core 是否为统一的
-    `--case-dir` + 位置参数 answer_file 接口，判断任务是否可跑可评分。"""
+def task_is_feasible(task_dir: Path) -> tuple[bool, list[str]]:
+    """判断任务是否可执行：工作区归档可读，且 eval_core 为统一评分接口。
+
+    仅检查“能不能跑、能不能评分”，不按产物格式过滤——
+    否则含 xlsx/pptx/pdf/docx 的任务会被静默跳过。
+    """
     reasons: list[str] = []
     tgz = task_dir / "environment" / "workspace.tar.gz"
     if not tgz.exists():
         return False, ["no workspace.tar.gz"]
-    bad = []
     try:
         with tarfile.open(tgz, "r:gz") as tar:
-            for m in tar.getmembers():
-                if m.isfile() and BINARY_EXT.search(m.name.rsplit("/", 1)[-1]):
-                    bad.append(m.name)
+            tar.getmembers()
     except Exception as exc:  # pragma: no cover - 仅在损坏归档时触发
         return False, [f"untar error: {exc}"]
-    if bad:
-        reasons.append(f"binary={bad[:2]}")
     # 统一评分接口：eval_core.py 需支持 "--case-dir" 且 gold 可经
     # WB_BENCH_GOLD_PATH 环境变量覆盖（这是 WorkBuddy Office 的主流约定）。
     # 答案的传入方式（位置参数 answer_file 或工作区 root）在 run_one 里自适应尝试。
@@ -181,7 +176,7 @@ def main() -> int:
     modes = [m for m in args.modes.split(",") if m in ("plan", "planner_worker")]
     runs_root = Path(args.runs)
 
-    # 收集文本可行任务
+    # 收集可执行任务（不按产物格式过滤）
     only_ids = {s.strip() for s in args.only.split(",") if s.strip()}
     feasible, skipped = [], []
     for d in sorted(tasks_dir.iterdir()):
@@ -189,12 +184,12 @@ def main() -> int:
             continue
         if only_ids and d.name not in only_ids:
             continue
-        ok, bad = task_is_text_feasible(d)
+        ok, bad = task_is_feasible(d)
         if ok:
             feasible.append(d)
         else:
             skipped.append((d.name, bad[:2]))
-    print(f"文本可行任务 {len(feasible)} 个；跳过 {len(skipped)} 个：{skipped[:5]}……")
+    print(f"可执行任务 {len(feasible)} 个；跳过 {len(skipped)} 个：{skipped[:5]}……")
 
     repo = Path(__file__).resolve().parent.parent
     exe = runs_root.parent / "office-runner" / ("office-runner.exe")

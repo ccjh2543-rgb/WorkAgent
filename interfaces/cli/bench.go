@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	appeval "simpleAgent/application/eval"
@@ -30,15 +31,17 @@ func defaultBenchCacheDir() (string, error) {
 // runBench 分派 --bench 子命令。
 func runBench(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("--bench 用法：--bench run|report [参数]")
+		return errors.New("--bench 用法：--bench run|report|validate [参数]")
 	}
 	switch args[0] {
 	case "run":
 		return runBenchRun(ctx, args[1:])
 	case "report":
 		return runBenchReport(ctx, args[1:])
+	case "validate":
+		return runBenchValidate(ctx, args[1:])
 	default:
-		return fmt.Errorf("未知 --bench 子命令 %q，可选 run、report", args[0])
+		return fmt.Errorf("未知 --bench 子命令 %q，可选 run、report、validate", args[0])
 	}
 }
 
@@ -100,6 +103,63 @@ func runBenchRun(ctx context.Context, args []string) error {
 	}
 	printBenchSummary(summary, filepath.Join(root, runID))
 	return nil
+}
+
+// runBenchValidate 校验任务集能否全部执行，并汇总交付能力缺口。
+//
+// 只读任务包、不调用模型，用于在动辄数小时的全量运行前先确认
+// “50/50 可执行、0 静默跳过”，并暴露当前写能力不覆盖的产物类型。
+func runBenchValidate(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("bench validate", flag.ContinueOnError)
+	dataset := fs.String("dataset", os.Getenv("WB_BENCH_DATASET"), "任务集目录")
+	writable := fs.String("writable", "xlsx,md,json,txt,csv,text", "当前支持写出的产物类型，逗号分隔")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*dataset) == "" {
+		return errors.New("必须指定 --dataset")
+	}
+	tasks, err := bench.Loader{}.LoadDataset(ctx, *dataset)
+	if err != nil {
+		return err
+	}
+	summary := appeval.AnalyzeCoverage(tasks, splitCSV(*writable))
+
+	fmt.Printf("\n==== 任务集校验 %s ====\n", *dataset)
+	fmt.Printf("任务总数: %d  可执行: %d  不可执行: %d\n",
+		summary.Total, summary.Valid, summary.Invalid)
+	if len(summary.Issues) > 0 {
+		fmt.Println("不可执行任务：")
+		for _, issue := range summary.Issues {
+			fmt.Printf("  %s -> %s\n", issue.TaskID, issue.Reason)
+		}
+	}
+	if len(summary.ArtifactTypes) > 0 {
+		fmt.Printf("产物类型需求（按任务去重）: %s\n", formatTypeCounts(summary.ArtifactTypes))
+	}
+	if len(summary.MissingArtifactTypes) > 0 {
+		fmt.Printf("写能力缺口: %s\n", strings.Join(summary.MissingArtifactTypes, ","))
+	} else {
+		fmt.Println("写能力缺口: 无")
+	}
+	if summary.Invalid > 0 {
+		return fmt.Errorf("有 %d 个任务包不可执行", summary.Invalid)
+	}
+	return nil
+}
+
+// formatTypeCounts 把产物类型计数格式化为稳定顺序的 key=count 字符串。
+func formatTypeCounts(counts map[string]int) string {
+	kinds := make([]string, 0, len(counts))
+	for kind := range counts {
+		kinds = append(kinds, kind)
+	}
+	sort.Strings(kinds)
+	parts := make([]string, 0, len(kinds))
+	for _, kind := range kinds {
+		parts = append(parts, fmt.Sprintf("%s=%d", kind, counts[kind]))
+	}
+	return strings.Join(parts, " ")
 }
 
 // newBenchExecutor 按名称装配执行器。
