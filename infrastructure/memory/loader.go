@@ -61,14 +61,7 @@ func NewLoader(store *WorkspaceStore, retriever Retriever, topK, maxRunes int) *
 //	- [沟通偏好] 优先中文输出，代码注释使用中文
 //	</memory>
 func (l *Loader) BuildContext(ctx context.Context, query string) (string, error) {
-	if l == nil || l.store == nil {
-		return "", nil
-	}
-	doc, err := l.store.Load(ctx)
-	if err != nil {
-		return "", err
-	}
-	selected, err := l.retriever.Rank(ctx, query, doc.AllFragments(), l.topK)
+	selected, err := l.Search(ctx, query, 0)
 	if err != nil {
 		return "", err
 	}
@@ -76,6 +69,33 @@ func (l *Loader) BuildContext(ctx context.Context, query string) (string, error)
 		return "", nil
 	}
 	return l.render(selected), nil
+}
+
+// Search 按查询召回记忆片段，供运行中的按需检索工具使用。
+//
+// topK 非正数时使用装配器配置的默认条数。即使真源为空也会走一次检索，
+// 让索引借这次调用与真源同步，避免用户删改记忆后索引残留旧数据。
+func (l *Loader) Search(ctx context.Context, query string, topK int) ([]Fragment, error) {
+	if l == nil || l.store == nil {
+		return nil, nil
+	}
+	if topK <= 0 {
+		topK = l.topK
+	}
+	doc, err := l.store.Load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	selected, err := l.retriever.Rank(ctx, query, doc.AllFragments(), topK)
+	if err != nil {
+		return nil, err
+	}
+	if len(selected) == 0 {
+		return nil, nil
+	}
+	// 检索器只负责相关性；类型与时效在这里做小幅重排，
+	// 让决策/教训类记忆在名次接近时略占优，同时不破坏相关性主导顺序。
+	return RerankNow(selected), nil
 }
 
 // render 拼接记忆块，超出 maxRunes 时按顺序截断

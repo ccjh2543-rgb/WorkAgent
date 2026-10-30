@@ -1,6 +1,9 @@
 package memory
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestParseDocument 覆盖记忆文件解析的各种输入形态
 func TestParseDocument(t *testing.T) {
@@ -122,5 +125,68 @@ func TestDocumentAdd(t *testing.T) {
 	}
 	if got := len(doc.AllFragments()); got != 4 {
 		t.Fatalf("记忆条数不匹配: got %d, want 4", got)
+	}
+}
+
+// TestDocumentMetadataRoundTrip 验证带元数据的记忆可以原样往返。
+func TestDocumentMetadataRoundTrip(t *testing.T) {
+	doc := &Document{Title: defaultTitle}
+	doc.AddRecord(Fragment{
+		Section:    "架构约定",
+		Content:    "严格 DDD 分层",
+		Kind:       KindDecision,
+		Source:     SourceAgent,
+		ID:         "deadbeef",
+		UpdatedAt:  1700000000,
+		Supersedes: "cafebabe",
+	})
+
+	raw := doc.Render()
+	wantComment := "<!-- id:deadbeef kind:decision src:agent at:1700000000 supersedes:cafebabe -->"
+	if !strings.Contains(raw, wantComment) {
+		t.Fatalf("渲染结果缺少元数据注释，实际:\n%s", raw)
+	}
+
+	fragments := ParseDocument(raw).AllFragments()
+	if len(fragments) != 1 {
+		t.Fatalf("元数据应被解析回单条记忆，实际 %d 条", len(fragments))
+	}
+	f := fragments[0]
+	if f.Content != "严格 DDD 分层" || f.Kind != KindDecision || f.Source != SourceAgent ||
+		f.ID != "deadbeef" || f.UpdatedAt != 1700000000 || f.Supersedes != "cafebabe" {
+		t.Fatalf("元数据往返后不一致: %+v", f)
+	}
+}
+
+// TestParseDocumentKeepsPlainComment 验证普通 HTML 注释不会被误当作元数据。
+func TestParseDocumentKeepsPlainComment(t *testing.T) {
+	raw := "# 项目记忆\n\n## 架构约定\n- 普通内容 <!-- 只是备注 -->\n"
+	fragments := ParseDocument(raw).AllFragments()
+	if len(fragments) != 1 {
+		t.Fatalf("期望 1 条记忆，实际 %d 条", len(fragments))
+	}
+	if fragments[0].Content != "普通内容 <!-- 只是备注 -->" {
+		t.Fatalf("普通注释应保留在正文中，实际 %q", fragments[0].Content)
+	}
+	if fragments[0].Kind != "" {
+		t.Fatalf("普通注释不应产生元数据，实际类型 %q", fragments[0].Kind)
+	}
+}
+
+// TestAddRecordDefaults 验证带元数据追加的默认值与去重口径。
+func TestAddRecordDefaults(t *testing.T) {
+	doc := &Document{Title: defaultTitle}
+	if !doc.AddRecord(Fragment{Section: "架构约定", Content: "domain 层不依赖外部包"}) {
+		t.Fatal("首次写入应成功")
+	}
+	if doc.AddRecord(Fragment{Section: "架构约定", Content: "domain 层不依赖外部包", Kind: KindDecision}) {
+		t.Fatal("同章节同正文应去重")
+	}
+	f := doc.AllFragments()[0]
+	if f.Kind != KindFact {
+		t.Fatalf("类型为空时应按事实处理，实际 %q", f.Kind)
+	}
+	if f.Scope != ScopeWorkspace {
+		t.Fatalf("作用域应默认为工作区，实际 %q", f.Scope)
 	}
 }

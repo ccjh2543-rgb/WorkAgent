@@ -2,12 +2,15 @@ package memory
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -90,6 +93,56 @@ func (s *WorkspaceStore) Append(ctx context.Context, section, content string) er
 		return nil
 	}
 	return s.writeAtomic(doc.Render())
+}
+
+// AppendRecord 追加一条带元数据的记忆。
+//
+// 与 Append 的区别：补齐类型、来源、写入时间与稳定 ID，这些字段是后续
+// 去重、冲突消解与检索重排的依据。任何字段缺失都有安全默认值，
+// 因此调用方只需关心正文与章节。
+func (s *WorkspaceStore) AppendRecord(ctx context.Context, frag Fragment) error {
+	frag.Content = strings.TrimSpace(frag.Content)
+	if frag.Content == "" {
+		return errors.New("记忆内容不能为空")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	frag.Section = strings.TrimSpace(frag.Section)
+	if frag.Scope == "" {
+		frag.Scope = ScopeWorkspace
+	}
+	if frag.Kind == "" {
+		frag.Kind = KindFact
+	}
+	if frag.Source == "" {
+		frag.Source = SourceUser
+	}
+	if frag.UpdatedAt == 0 {
+		frag.UpdatedAt = time.Now().Unix()
+	}
+	if frag.ID == "" {
+		frag.ID = fragmentID(frag.Content)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	doc, err := s.loadLocked()
+	if err != nil {
+		return err
+	}
+	if !doc.AddRecord(frag) {
+		return nil
+	}
+	return s.writeAtomic(doc.Render())
+}
+
+// fragmentID 用正文哈希作为稳定标识：同一内容在任何机器上得到同一 ID，
+// 便于跨会话比较与后续的取代关系（supersedes）追踪。
+func fragmentID(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:8])
 }
 
 // loadLocked 在已持有锁的前提下读取并解析记忆文件

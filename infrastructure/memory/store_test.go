@@ -86,6 +86,46 @@ func TestWorkspaceStoreAppendRejectsEmptyContent(t *testing.T) {
 	}
 }
 
+// TestWorkspaceStoreAppendRecord 验证带元数据的写入会补齐默认值并落盘。
+func TestWorkspaceStoreAppendRecord(t *testing.T) {
+	store := NewWorkspaceStore(t.TempDir())
+	ctx := context.Background()
+
+	if err := store.AppendRecord(ctx, Fragment{
+		Section:   "架构约定",
+		Content:   "严格 DDD 分层",
+		Kind:      KindDecision,
+		Source:    SourceAgent,
+		UpdatedAt: 1700000000,
+	}); err != nil {
+		t.Fatalf("写入带元数据的记忆失败: %v", err)
+	}
+
+	doc, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("读取记忆失败: %v", err)
+	}
+	fragments := doc.AllFragments()
+	if len(fragments) != 1 {
+		t.Fatalf("期望 1 条记忆，实际 %d 条", len(fragments))
+	}
+	f := fragments[0]
+	if f.Kind != KindDecision || f.Source != SourceAgent || f.UpdatedAt != 1700000000 {
+		t.Fatalf("元数据未正确落盘: %+v", f)
+	}
+	if f.ID == "" {
+		t.Fatal("缺少正文哈希 ID")
+	}
+
+	data, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("读取记忆文件失败: %v", err)
+	}
+	if !strings.Contains(string(data), "kind:decision") || !strings.Contains(string(data), "src:agent") {
+		t.Fatalf("记忆文件缺少元数据注释:\n%s", string(data))
+	}
+}
+
 // TestWorkspaceStoreConcurrentAppend 并发写入不应丢数据或损坏文件
 func TestWorkspaceStoreConcurrentAppend(t *testing.T) {
 	const writers = 20

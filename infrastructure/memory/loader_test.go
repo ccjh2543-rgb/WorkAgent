@@ -71,3 +71,28 @@ func TestLoaderBuildContext(t *testing.T) {
 		}
 	})
 }
+
+// TestLoaderSearch 验证按需检索返回带元数据的片段，且条数受 topK 约束。
+func TestLoaderSearch(t *testing.T) {
+	ctx := context.Background()
+	store := NewWorkspaceStore(t.TempDir())
+	if err := store.AppendRecord(ctx, Fragment{
+		Section: "架构约定",
+		Content: "严格 DDD 分层",
+		Kind:    KindDecision,
+	}); err != nil {
+		t.Fatalf("写入记忆失败: %v", err)
+	}
+	loader := NewLoader(store, nil, 0, 0)
+
+	fragments, err := loader.Search(ctx, "DDD", 3)
+	if err != nil {
+		t.Fatalf("检索记忆失败: %v", err)
+	}
+	if len(fragments) != 1 {
+		t.Fatalf("期望 1 条记忆，实际 %d 条", len(fragments))
+	}
+	if fragments[0].Content != "严格 DDD 分层" || fragments[0].Kind != KindDecision {
+		t.Fatalf("检索结果缺少元数据: %+v", fragments[0])
+	}
+}

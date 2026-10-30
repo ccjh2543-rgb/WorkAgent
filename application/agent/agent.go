@@ -617,6 +617,11 @@ func (a *Agent) initMemory(projectDir string) {
 		a.closers = append(a.closers, closer)
 	}
 	a.memLoad = memory.NewLoader(store, retriever, 0, 0)
+	// 运行中按需召回：只读、自动放行，避免把全部记忆一次性塞进上下文
+	a.toolReg.RegisterWithPolicy(tools.NewMemorySearchTool(a.memLoad), tool.ToolPolicy{
+		Risk:        tool.RiskReadOnly,
+		AutoApprove: true,
+	})
 }
 
 // buildRetriever 组装混合检索器：SQLite 索引 + 阿里云百炼 embedding。
