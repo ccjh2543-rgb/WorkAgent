@@ -147,14 +147,6 @@ func (s *Server) registerSkillsInto(a *appagent.Agent) error {
 
 // Serve 启动 HTTP 服务并阻塞，直到 ctx 被取消后优雅退出。
 func (s *Server) Serve(ctx context.Context, addr string) error {
-	// 退出时先回收会话实例，再关闭审计日志，避免实例在日志关闭后仍写审计
-	defer func() {
-		if s.manager != nil {
-			if err := s.manager.Close(); err != nil {
-				fmt.Printf("[会话实例回收失败] %v\n", err)
-			}
-		}
-	}()
 	if s.ownsAudit {
 		defer func() {
 			if err := s.audit.Close(); err != nil {
@@ -162,6 +154,15 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 			}
 		}()
 	}
+	// defer 按逆序执行：这里注册得比审计晚，因此会先回收会话实例，
+	// 再关闭审计日志，避免实例在日志关闭后仍写审计
+	defer func() {
+		if s.manager != nil {
+			if err := s.manager.Close(); err != nil {
+				fmt.Printf("[会话实例回收失败] %v\n", err)
+			}
+		}
+	}()
 	mux := http.NewServeMux()
 	s.routes(mux)
 
