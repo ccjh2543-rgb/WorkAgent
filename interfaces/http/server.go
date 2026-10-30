@@ -204,6 +204,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/auth/status", s.auth.Status)
 	mux.HandleFunc("/api/auth/logout", s.protect(s.auth.Logout))
 	mux.HandleFunc("/api/tools", s.protect(s.handleTools))
+	mux.HandleFunc("/api/memory/consolidate", s.protect(s.handleMemoryConsolidate))
 	mux.HandleFunc("/api/skills", s.protect(s.handleSkills))
 	mux.HandleFunc("/api/skills/", s.protect(s.handleSkillDelete))
 	mux.HandleFunc("/api/conversations", s.protect(s.handleConversations))
@@ -256,6 +257,26 @@ func (s *Server) handleTools(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.agent.ListTools())
+}
+
+// handleMemoryConsolidate 触发一次记忆整合作业：跨章节去重、归档过期流程类记忆。
+// 定时任务或用户在设置页手动触发，返回本次整合的统计。
+func (s *Server) handleMemoryConsolidate(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	report, err := s.agent.ConsolidateMemory(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.audit.Log(audit.Event{
+		Type:   "memory",
+		Action: "consolidate",
+		Source: clientIP(r),
+		Detail: fmt.Sprintf("deduped=%d archived=%d", report.Deduped, report.Archived),
+	})
+	writeJSON(w, http.StatusOK, report)
 }
 
 // handleConversations 列表或新建对话

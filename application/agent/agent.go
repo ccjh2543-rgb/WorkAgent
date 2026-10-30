@@ -530,6 +530,15 @@ func (a *Agent) ContextSnapshot() *ContextReport {
 	return a.contextReport.Load()
 }
 
+// ConsolidateMemory 触发一次记忆整合作业：跨章节去重并归档过期流程类记忆。
+// 返回整合统计；持久记忆未启用时返回错误。
+func (a *Agent) ConsolidateMemory(ctx context.Context) (memory.ConsolidateReport, error) {
+	if a.memStore == nil {
+		return memory.ConsolidateReport{}, errors.New("持久记忆未启用，无法整合")
+	}
+	return a.memStore.Consolidate(ctx, time.Now(), memory.DefaultArchiveAge)
+}
+
 // emit 触发一次事件上报；未注册回调时为空操作
 func (a *Agent) emit(ev domainagent.AgentEvent) {
 	if a.onEvent == nil {
