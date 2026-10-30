@@ -92,6 +92,8 @@ func (c *compactionState) exhausted() bool {
 //
 // 压缩只影响「送给模型的副本」：Memory 与会话树里的原始消息一条不动。
 func (a *Agent) prepareContext(ctx context.Context) ([]domainagent.ChatMessage, error) {
+	// 稳定前缀：系统提示词与记忆块。两者在一次 Run 内逐字节不变，
+	// 放在最前面才能让模型服务端的前缀缓存持续命中。
 	head := []domainagent.ChatMessage{{
 		Role:    session.RoleSystem,
 		Content: a.systemPrompt,
@@ -102,17 +104,19 @@ func (a *Agent) prepareContext(ctx context.Context) ([]domainagent.ChatMessage, 
 			Content: a.memBlock,
 		})
 	}
-	// 任务状态是「钉子信息」：每轮按最新事实重新渲染，永不参与压缩
-	if state := a.renderTaskState(); state != "" {
-		head = append(head, domainagent.ChatMessage{
-			Role:    session.RoleSystem,
-			Content: state,
-		})
+
+	// 任务锚点每轮都要按最新进度重新渲染，因此必须放在消息序列最尾部：
+	// 若留在前缀里，它每轮变化会让其后全部历史失去缓存。
+	anchor := a.renderTaskState()
+	anchorTokens := 0
+	if anchor != "" {
+		anchorTokens = a.countTokens(ctx, anchor) + messageOverheadTokens
 	}
 
 	entries := a.memory.Entries()
 	folded := foldEntries(entries, a.foldHeadRunes, a.foldTailRunes)
-	headTokens := a.countMessagesTokens(ctx, head)
+	// 锚点虽在尾部，也要计入预算，否则压缩后会挤爆窗口
+	headTokens := a.countMessagesTokens(ctx, head) + anchorTokens
 
 	start := a.compaction.compactedCount
 	if start > len(folded) {
@@ -121,6 +125,7 @@ func (a *Agent) prepareContext(ctx context.Context) ([]domainagent.ChatMessage, 
 		start = 0
 	}
 
+	rounds := 0
 	for round := 0; round < maxCompactionRounds; round++ {
 		if a.compaction.exhausted() {
 			break
@@ -132,6 +137,7 @@ func (a *Agent) prepareContext(ctx context.Context) ([]domainagent.ChatMessage, 
 		}
 		// 观测：本次真正触发了压缩
 		a.metrics.compactionRounds.Add(1)
+		rounds++
 		if err := a.compactRange(ctx, folded[start:start+relative]); err != nil {
 			// 摘要失败不能让任务中断：降级为丢弃最旧的消息，并记录告警
 			fmt.Printf("[上下文摘要失败，降级为丢弃最旧消息]:%v\n", err)
@@ -141,8 +147,15 @@ func (a *Agent) prepareContext(ctx context.Context) ([]domainagent.ChatMessage, 
 		start = a.compaction.compactedCount
 	}
 
-	// 观测：汇总本请求的折叠压力、新增摘要条目与发送 token
 	messages := a.assemble(head, folded)
+	if anchor != "" {
+		messages = append(messages, domainagent.ChatMessage{
+			Role:    session.RoleSystem,
+			Content: anchor,
+		})
+	}
+
+	// 观测：汇总本请求的折叠压力、新增摘要条目与发送 token
 	var trunc int64
 	for i, e := range folded {
 		if e.Content != entries[i].Content {
@@ -152,10 +165,54 @@ func (a *Agent) prepareContext(ctx context.Context) ([]domainagent.ChatMessage, 
 	if trunc > 0 {
 		storeMaxInt64(&a.metrics.foldedToolResults, trunc)
 	}
-	storeMaxInt64(&a.metrics.maxWindowTokens, int64(a.countMessagesTokens(ctx, messages)))
+	total := a.countMessagesTokens(ctx, messages)
+	storeMaxInt64(&a.metrics.maxWindowTokens, int64(total))
 	a.metrics.compactedEntries.Add(int64(a.compaction.compactedCount - start))
 
+	a.storeContextReport(ctx, head, messages, folded, total, anchorTokens, int(trunc), rounds)
 	return messages, nil
+}
+
+// storeContextReport 计算并保存本次装配的分区用量快照。
+// 各分区之和严格等于 TotalTokens：窗口用量用总量减去其余分区得到，
+// 避免逐条重复计数带来的口径漂移。
+func (a *Agent) storeContextReport(ctx context.Context, head, messages []domainagent.ChatMessage,
+	folded []domainagent.Entry, total, anchorTokens, foldedEntries, rounds int) {
+	report := ContextReport{
+		BudgetTokens:     a.contextBudget,
+		TotalTokens:      total,
+		Messages:         len(messages),
+		AnchorTokens:     anchorTokens,
+		FoldedEntries:    foldedEntries,
+		CompactionRounds: rounds,
+		CompactedEntries: a.compaction.compactedCount,
+	}
+	report.PolicyTokens = a.countTokens(ctx, head[0].Content) + messageOverheadTokens
+	if len(head) > 1 {
+		report.MemoryTokens = a.countTokens(ctx, head[1].Content) + messageOverheadTokens
+	}
+	if a.compaction.summary != "" {
+		report.SummaryTokens = a.countTokens(ctx, renderSummary(a.compaction.summary)) + messageOverheadTokens
+	}
+	report.WindowTokens = total - report.PolicyTokens - report.MemoryTokens -
+		report.SummaryTokens - report.AnchorTokens
+	if report.WindowTokens < 0 {
+		report.WindowTokens = 0
+	}
+	covered := a.compaction.compactedCount
+	if covered > len(folded) {
+		covered = len(folded)
+	}
+	if total > 0 {
+		toolTokens := 0
+		for _, entry := range folded[covered:] {
+			if entry.Kind == session.KindToolResult {
+				toolTokens += a.countTokens(ctx, entry.Content) + messageOverheadTokens
+			}
+		}
+		report.ToolOutputShare = float64(toolTokens) / float64(total)
+	}
+	a.contextReport.Store(&report)
 }
 
 // storeMaxInt64 把 v 以「保最大值」方式写入原子计数（gauge 语义）。
@@ -231,7 +288,8 @@ func renderSummary(summary string) string {
 		summary + "\n</对话摘要>"
 }
 
-// renderTaskState 把当前任务进度渲染成一个固定段。
+// renderTaskState 把当前任务进度渲染成任务锚点。
+// 它每轮都会变化，调用方必须把它放在消息序列最尾部，避免打断前缀缓存。
 func (a *Agent) renderTaskState() string {
 	if len(a.planner.Tasks) == 0 {
 		return ""

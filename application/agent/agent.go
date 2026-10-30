@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -77,6 +78,9 @@ type Agent struct {
 	compaction compactionState
 	// metrics 上下文压缩/折叠/裁剪的可观测计数（判断窗口阈值是否合理）
 	metrics AgentMetrics
+	// contextReport 最近一次上下文装配的分区用量快照。
+	// 使用原子指针，允许指标接口在运行过程中并发读取而不加锁。
+	contextReport atomic.Pointer[ContextReport]
 	// onEvent 可选的运行事件回调，供上层（HTTP/WS 服务）实时上报进度。
 	// 为 nil 时不产生任何额外行为，不影响原有调用方。
 	onEvent func(domainagent.AgentEvent)
@@ -148,7 +152,14 @@ const (
 	defaultMaxHistoryRunes = 200000
 	// defaultSessionRetention 会话保留期，超过后由清理任务删除
 	defaultSessionRetention = 30 * 24 * time.Hour
+	// minContextBudget 允许的最小上下文预算。低于该值时压缩无法保留
+	// 足够近的窗口，反而会制造更多摘要请求，因此直接拒绝。
+	minContextBudget = 8192
 )
+
+// envContextBudget 上下文预算的环境变量覆盖名。
+// 用于在不改代码的情况下适配不同模型的窗口大小。
+const envContextBudget = "SIMPLEAGENT_CONTEXT_BUDGET"
 
 // 记忆向量化服务的环境变量名，敏感值只从环境读取，不写入代码
 const (
@@ -215,6 +226,15 @@ func NewAgentWithOptions(chatModel domainagent.ChatModel, opts Options) *Agent {
 	}
 	agent.foldHeadRunes = foldHead
 	agent.foldTailRunes = foldTail
+	// 上下文预算允许按部署环境覆盖：不同模型的窗口差异很大，
+	// 写死常量会让小窗口模型频繁被拒、大窗口模型浪费预算。
+	if raw := strings.TrimSpace(os.Getenv(envContextBudget)); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			agent.SetContextBudget(n)
+		} else {
+			fmt.Printf("[上下文预算配置无效，使用默认值]:%s\n", raw)
+		}
+	}
 	// 注册内置示例工具：只读工具自动放行
 	agent.toolReg.RegisterWithPolicy(&tools.CalculatorTool{}, tool.ToolPolicy{Risk: tool.RiskReadOnly, AutoApprove: true})
 	agent.toolReg.RegisterWithPolicy(&tools.SearchMockTool{}, tool.ToolPolicy{Risk: tool.RiskReadOnly, AutoApprove: true})
@@ -315,6 +335,8 @@ type WbMetrics struct {
 	DroppedWorkerEntries int64 `json:"dropped_worker_entries"`
 	MaxWindowTokens      int64 `json:"max_window_tokens"`
 	LLMCalls             int64 `json:"llm_calls"`
+	// Context 最近一次上下文装配的分区用量；未装配时为 null。
+	Context *ContextReport `json:"context,omitempty"`
 }
 
 // metricsSnapshot 读取当前计数为不可变快照。
@@ -326,6 +348,7 @@ func (a *Agent) metricsSnapshot() WbMetrics {
 		DroppedWorkerEntries: a.metrics.droppedWorkerEntries.Load(),
 		MaxWindowTokens:      a.metrics.maxWindowTokens.Load(),
 		LLMCalls:             a.metrics.llmCalls.Load(),
+		Context:              a.contextReport.Load(),
 	}
 }
 
@@ -342,6 +365,7 @@ func (a *Agent) traceLLM(messages []domainagent.ChatMessage, reply domainagent.C
 		"messages":   messages,
 		"reply":      reply.Content,
 		"tool_calls": reply.ToolCalls,
+		"context":    a.contextReport.Load(),
 	}
 	b, err := json.Marshal(rec)
 	if err != nil {
@@ -426,6 +450,26 @@ func (a *Agent) SetTokenizer(t domainagent.Tokenizer) {
 	a.tokenizer = t
 	// 计数口径变化会影响预算判断，失效已做的压缩缓存
 	a.compaction.reset()
+}
+
+// SetContextBudget 覆盖单次请求的上下文预算（估算 token）。
+//
+// 传非正数恢复默认预算；低于最小预算时按最小预算处理。
+// 预算变化会让已有压缩判断失效，因此同时清空压缩缓存。
+func (a *Agent) SetContextBudget(tokens int) {
+	if tokens <= 0 {
+		tokens = defaultContextBudget
+	}
+	if tokens < minContextBudget {
+		tokens = minContextBudget
+	}
+	a.contextBudget = tokens
+	a.compaction.reset()
+}
+
+// ContextSnapshot 返回最近一次上下文装配的分区用量快照；尚未装配时返回 nil。
+func (a *Agent) ContextSnapshot() *ContextReport {
+	return a.contextReport.Load()
 }
 
 // emit 触发一次事件上报；未注册回调时为空操作

@@ -124,6 +124,7 @@ Docker 执行器行为：
 | `SIMPLEAGENT_SESSION_TTL` | `24h` | 登录会话有效期 |
 | `SIMPLEAGENT_APPROVAL_TIMEOUT` | `2m` | 审批超时，超时按拒绝处理 |
 | `SIMPLEAGENT_TOKENIZER_PATH` | 仓库内资产 | 离线 tokenizer.json 路径 |
+| `SIMPLEAGENT_CONTEXT_BUDGET` | `400000` | 单次请求上下文预算（估算 token），用于适配不同模型的窗口大小 |
 
 ## 测试
 

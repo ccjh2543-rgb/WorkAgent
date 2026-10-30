@@ -67,6 +67,12 @@ func (t *RememberTool) Run(args string) (string, error) {
 	if section == "" {
 		section = "未分类"
 	}
+	if err := memory.ValidateSection(section); err != nil {
+		return "", err
+	}
+	if err := memory.ValidateCandidate(content); err != nil {
+		return "", err
+	}
 	if err := t.store.Append(context.Background(), section, content); err != nil {
 		return "", err
 	}
