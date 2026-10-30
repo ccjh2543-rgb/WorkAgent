@@ -41,13 +41,19 @@ import (
 //
 // 它承载一次 Run 的参数与运行期状态（会话、记忆、工具、审批），
 // 通过注入的 ChatModel 端口驱动推理。刻意不并发安全：同一实例上的
-// Run / WorkBench 任务必须串行调用。
+// Run / WorkBench 任务必须串行调用。多会话场景请通过 Manager 获取
+// 独立实例，不要复用同一个 Agent 并发执行。
 type Agent struct {
 	chatModel domainagent.ChatModel // 模型端口，由构造注入（eino 实现）
-	memory    *domainagent.Memory   // 本轮上下文的临时消息序列
-	planner   *planner.Planner      // 任务拆解与进度跟踪
-	toolReg   *tool.ToolRegistry    // 工具注册表
-	maxLoop   int                   // 最大循环次数防止死循环
+	// baseModel 未经计数装饰的模型端口。会话级克隆用它重建自己的计数装饰，
+	// 避免多个会话把调用次数记到同一个指标上。
+	baseModel domainagent.ChatModel
+	// opts 装配选项（工作区、状态目录、路径例外、审计），供会话级克隆复用
+	opts    Options
+	memory  *domainagent.Memory // 本轮上下文的临时消息序列
+	planner *planner.Planner    // 任务拆解与进度跟踪
+	toolReg *tool.ToolRegistry  // 工具注册表
+	maxLoop int                 // 最大循环次数防止死循环
 
 	// approver 人工确认端口。默认 DenyApprover（无审批通道即拒绝），
 	// 需要人在回路时显式替换为 Interactive/WS 审批器
@@ -186,6 +192,9 @@ type Options struct {
 	PathAllow []string
 	// Audit 审计日志；nil 表示不记录。
 	Audit *audit.Logger
+	// DisableLLMTrace 关闭 LLM 请求/响应落盘。
+	// 会话级克隆默认关闭：trace 是进程级诊断，多实例并发写同一文件没有意义。
+	DisableLLMTrace bool
 }
 
 // NewAgent 使用默认选项装配 Agent（工作区为进程当前目录）。
@@ -209,6 +218,8 @@ func NewAgentWithOptions(chatModel domainagent.ChatModel, opts Options) *Agent {
 	mem := domainagent.NewMemory()
 	agent := &Agent{
 		chatModel:          chatModel,
+		baseModel:          chatModel,
+		opts:               opts,
 		nativeTools:        supportsNativeTools(chatModel),
 		memory:             mem,
 		planner:            planner.NewPlanner(),
@@ -275,10 +286,45 @@ func NewAgentWithOptions(chatModel domainagent.ChatModel, opts Options) *Agent {
 
 	// 工具列表必须在所有工具注册完成之后才渲染。
 	agent.renderSystemPrompt()
-	agent.initLLMTrace()
+	if !opts.DisableLLMTrace {
+		agent.initLLMTrace()
+	}
+	// 记录已解析的目录，供会话级克隆直接复用；避免克隆时按当前工作目录重新推导
+	agent.opts = Options{
+		WorkspaceRoot:   projectDir,
+		StateRoot:       stateDir,
+		PathAllow:       opts.PathAllow,
+		Audit:           opts.Audit,
+		DisableLLMTrace: opts.DisableLLMTrace,
+	}
 	// 统一 LLM 调用计数：装饰包住注入模型，拦下所有 Generate（含 domain 决策器与摘要生成）
 	agent.chatModel = &countingModel{inner: chatModel, ctr: &agent.metrics.llmCalls}
 	return agent
+}
+
+// NewSessionAgent 创建一个运行态完全独立的会话实例。
+//
+// 实例共享同一套配置（模型、工作区、状态目录、审计与路径例外），
+// 但拥有独立的模型消息序列、计划、压缩缓存、指标与工具注册表；
+// 会话库与记忆索引各自持有连接。调用方负责在实例不再使用时 Close。
+func (a *Agent) NewSessionAgent() (*Agent, error) {
+	if a.baseModel == nil {
+		return nil, errors.New("模型端口未初始化，无法创建会话实例")
+	}
+	opts := a.opts
+	// trace 是进程级诊断，克隆实例不重复打开同一个文件
+	opts.DisableLLMTrace = true
+	clone := NewAgentWithOptions(a.baseModel, opts)
+	clone.model = a.model
+	clone.maxLoop = a.maxLoop
+	clone.maxToolFailures = a.maxToolFailures
+	clone.contextBudget = a.contextBudget
+	clone.tokenizer = a.tokenizer
+	clone.foldHeadRunes = a.foldHeadRunes
+	clone.foldTailRunes = a.foldTailRunes
+	clone.sysTemplate = a.sysTemplate
+	clone.renderSystemPrompt()
+	return clone, nil
 }
 
 // countingModel 给底层 ChatModel 包一层「调用次数」计数，统计单个任务累计的模型调用次数。

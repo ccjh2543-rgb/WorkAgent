@@ -48,6 +48,9 @@ type wsClient struct {
 	server  *Server
 	conn    *websocket.Conn
 	writeMu sync.Mutex
+	// runMu 同一连接上的对话串行执行：审批器与取消句柄都是连接级单槽，
+	// 并发运行会互相覆盖；不同连接之间互不影响，可并行执行不同会话。
+	runMu sync.Mutex
 	// 运行期状态，由 readLoop(读) 与 run 协程(写) 共享，用 appMu 保护
 	appMu    sync.Mutex
 	approver *wsApprover
@@ -96,22 +99,33 @@ func (c *wsClient) send(v any) error {
 }
 
 // handleChat 处理一次对话请求。
-// 通过全局 run 锁保证同一时刻只有一个会话在跑；已被占用则立即告知而非排队挂起。
+//
+// 每个会话从 SessionManager 取独立实例：同一会话串行、不同会话可并行。
+// 会话 ID 为空时先生成一个，再按该 ID 获取实例，避免把新会话都落到同一个实例上。
 func (c *wsClient) handleChat(msg inboundMsg) {
+	c.runMu.Lock()
+	defer c.runMu.Unlock()
+
 	s := c.server
-	s.runMu.Lock()
-	if s.busy {
-		s.runMu.Unlock()
-		c.send(outMsg{Type: "status", Message: "另一会话正在执行，请稍候再试"})
+	if s.manager == nil {
+		c.send(outMsg{Type: "error", Message: "会话管理器未初始化"})
 		return
 	}
-	s.busy = true
-	s.runMu.Unlock()
-	defer func() {
-		s.runMu.Lock()
-		s.busy = false
-		s.runMu.Unlock()
-	}()
+	sessionID := strings.TrimSpace(msg.SessionID)
+	if sessionID == "" {
+		id, err := s.agent.CreateSession()
+		if err != nil {
+			c.send(outMsg{Type: "error", Message: err.Error()})
+			return
+		}
+		sessionID = id
+	}
+	sessionAgent, release, err := s.manager.Acquire(sessionID)
+	if err != nil {
+		c.send(outMsg{Type: "error", Message: err.Error()})
+		return
+	}
+	defer release()
 
 	// 本次运行的取消句柄，供用户「stop」中断
 	ctx, cancel := context.WithCancel(context.Background())
@@ -129,18 +143,18 @@ func (c *wsClient) handleChat(msg inboundMsg) {
 		c.appMu.Unlock()
 	}()
 
-	// 把 Agent 的审批与事件都接到这条连接上。run 锁保证并发安全。
-	s.agent.SetApprover(audit.WrapApprover(baseApprover, s.audit, "ws"))
-	s.agent.SetOnEvent(func(ev domainagent.AgentEvent) {
+	// 审批与事件接到当前会话实例上，不影响其他会话
+	sessionAgent.SetApprover(audit.WrapApprover(baseApprover, s.audit, "ws"))
+	sessionAgent.SetOnEvent(func(ev domainagent.AgentEvent) {
 		c.send(outMsg{Type: "event", SessionID: ev.SessionID, Event: &ev})
 	})
 	defer func() {
 		// 运行结束后回落到安全默认值：没有连接就没有审批通道，副作用操作必须拒绝
-		s.agent.SetApprover(dapproval.DenyApprover{})
-		s.agent.SetOnEvent(nil)
+		sessionAgent.SetApprover(dapproval.DenyApprover{})
+		sessionAgent.SetOnEvent(nil)
 	}()
 
-	answer, err := s.agent.Run(ctx, msg.SessionID, msg.Message)
+	answer, err := sessionAgent.Run(ctx, sessionID, msg.Message)
 	if err != nil {
 		// 用户主动停止会以 context.Canceled 结尾，给出友好提示而非红色报错
 		if errors.Is(err, context.Canceled) {
@@ -150,7 +164,7 @@ func (c *wsClient) handleChat(msg inboundMsg) {
 		}
 		return
 	}
-	c.send(outMsg{Type: "final", SessionID: s.agent.SessionID(), Answer: answer})
+	c.send(outMsg{Type: "final", SessionID: sessionAgent.SessionID(), Answer: answer})
 }
 
 // routeApproval 把用户的审批应答转发给当前正在等待确认的 approver

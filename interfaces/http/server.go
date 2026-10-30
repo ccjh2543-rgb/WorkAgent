@@ -5,8 +5,9 @@
 //   - WS：多轮对话 + 实时事件流 + 「人在回路」在线审批
 //   - 静态页托管：原生 HTML/JS 单页由 Go 直接提供，无需 Node 构建
 //
-// 并发模型：Agent 不并发安全，因此服务端持共享 Agent + 一把全局 run 锁，
-// 同一时刻只执行一个会话；会话的读操作（列表/历史/分支/回滚/分叉）可随时并发。
+// 并发模型：管理类接口（工具、会话、技能、WorkBench）共用控制实例；
+// 对话执行走 SessionManager，每个会话拿到独立实例，同一会话串行、
+// 不同会话可并行，避免运行态互相污染。
 package server
 
 import (
@@ -20,7 +21,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/net/websocket"
@@ -58,13 +58,12 @@ type Options struct {
 // Server 持有 HTTP/WS 服务所需的全部状态
 type Server struct {
 	agent     *appagent.Agent
+	manager   *appagent.Manager
 	workspace *tools.Workspace
 	opts      Options
 	auth      *Auth
 	audit     *audit.Logger
 	ownsAudit bool
-	runMu     sync.Mutex
-	busy      bool  // 是否有会话正在执行
 	wsConns   int64 // 当前活跃 WS 连接数（atomic）
 	skills    *SkillStore
 }
@@ -100,7 +99,7 @@ func NewServer(myAgent *appagent.Agent, projectDir string, opts Options) (*Serve
 	}
 	auth := newAuth(opts)
 	auth.audit = auditLog
-	return &Server{
+	srv := &Server{
 		agent:     myAgent,
 		workspace: ws,
 		opts:      opts,
@@ -108,7 +107,23 @@ func NewServer(myAgent *appagent.Agent, projectDir string, opts Options) (*Serve
 		audit:     auditLog,
 		ownsAudit: ownsAudit,
 		skills:    sk,
-	}, nil
+	}
+	// 对话执行按会话创建独立实例：共享配置，不共享运行态。
+	srv.manager = appagent.NewManager(func() (*appagent.Agent, error) {
+		clone, err := myAgent.NewSessionAgent()
+		if err != nil {
+			return nil, fmt.Errorf("创建会话实例失败: %w", err)
+		}
+		if err := srv.registerSkillsInto(clone); err != nil {
+			_ = clone.Close()
+			return nil, err
+		}
+		if opts.Headless && opts.Loopback {
+			clone.SetApprover(dapproval.AutoApprover{})
+		}
+		return clone, nil
+	})
+	return srv, nil
 }
 
 // RegisterStoredSkills 把持久化的自定义技能注册进 Agent。
@@ -117,15 +132,29 @@ func NewServer(myAgent *appagent.Agent, projectDir string, opts Options) (*Serve
 // headless 模式默认禁止命令技能执行；只有显式 AllowSkillExec 才注册，
 // 避免无人值守评测环境里出现任意命令执行通道。
 func (s *Server) RegisterStoredSkills() error {
+	return s.registerSkillsInto(s.agent)
+}
+
+// registerSkillsInto 把一个已持久化的技能集注册到指定实例。
+// headless 模式默认禁止命令技能执行，只有显式 AllowSkillExec 才注册，
+// 避免无人值守评测环境里出现任意命令执行通道。
+func (s *Server) registerSkillsInto(a *appagent.Agent) error {
 	if s.opts.Headless && !s.opts.AllowSkillExec {
-		fmt.Println("[安全提示] headless 模式未开启技能执行，已跳过持久化命令技能")
 		return nil
 	}
-	return s.skills.registerInto(s.agent, s.workspace, s.audit)
+	return s.skills.registerInto(a, s.workspace, s.audit)
 }
 
 // Serve 启动 HTTP 服务并阻塞，直到 ctx 被取消后优雅退出。
 func (s *Server) Serve(ctx context.Context, addr string) error {
+	// 退出时先回收会话实例，再关闭审计日志，避免实例在日志关闭后仍写审计
+	defer func() {
+		if s.manager != nil {
+			if err := s.manager.Close(); err != nil {
+				fmt.Printf("[会话实例回收失败] %v\n", err)
+			}
+		}
+	}()
 	if s.ownsAudit {
 		defer func() {
 			if err := s.audit.Close(); err != nil {
@@ -365,6 +394,10 @@ func (s *Server) handleSkills(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.audit.Log(audit.Event{Type: "skill", Action: "add", Source: clientIP(r), Detail: spec.Name})
+		// 技能集变化后让空闲实例失效，新会话才能拿到最新的工具集
+		if s.manager != nil {
+			s.manager.EvictIdle()
+		}
 		writeJSON(w, http.StatusCreated, spec)
 	default:
 		writeErr(w, http.StatusMethodNotAllowed, "仅支持 GET/POST")
@@ -392,6 +425,9 @@ func (s *Server) handleSkillDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit.Log(audit.Event{Type: "skill", Action: "remove", Source: clientIP(r), Detail: name})
+	if s.manager != nil {
+		s.manager.EvictIdle()
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
