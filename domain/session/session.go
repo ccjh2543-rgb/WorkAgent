@@ -54,6 +54,9 @@ const (
 	KindGuidance Kind = "guidance"
 	// KindSubtaskResult Planner-Worker 模式下记录到主会话的子任务结果摘要
 	KindSubtaskResult Kind = "subtask_result"
+	// KindCompaction 上下文压缩记录：保存摘要与覆盖范围，不参与模型消息序列。
+	// 它随会话树持久化，使压缩结果在重启、断点续跑与分支切换后仍然有效。
+	KindCompaction Kind = "compaction"
 )
 
 // Rollbackable 判断该消息能否作为回滚点

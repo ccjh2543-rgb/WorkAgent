@@ -88,6 +88,14 @@ func (c *compactionState) exhausted() bool {
 	return c.failCount >= maxCompactionFailures
 }
 
+// resetCompaction 同时清空内存摘要与已持久化标记。
+// 二者必须一起重置：只清摘要会让下一次压缩误以为旧范围已经落盘，
+// 从而漏写压缩记录，重启后丢掉已经付过费的摘要。
+func (a *Agent) resetCompaction() {
+	a.compaction.reset()
+	a.persistedCompaction = 0
+}
+
 // prepareContext 组装本轮请求消息，并在超出预算时做上下文压缩。
 //
 // 压缩只影响「送给模型的副本」：Memory 与会话树里的原始消息一条不动。
@@ -114,14 +122,14 @@ func (a *Agent) prepareContext(ctx context.Context) ([]domainagent.ChatMessage, 
 	}
 
 	entries := a.memory.Entries()
-	folded := foldEntries(entries, a.foldHeadRunes, a.foldTailRunes)
+	folded := a.foldEntries(entries)
 	// 锚点虽在尾部，也要计入预算，否则压缩后会挤爆窗口
 	headTokens := a.countMessagesTokens(ctx, head) + anchorTokens
 
 	start := a.compaction.compactedCount
 	if start > len(folded) {
 		// 上下文变短（例如历史被替换）时缓存已失效，重置后重新评估
-		a.compaction.reset()
+		a.resetCompaction()
 		start = 0
 	}
 
@@ -148,6 +156,10 @@ func (a *Agent) prepareContext(ctx context.Context) ([]domainagent.ChatMessage, 
 	}
 
 	messages := a.assemble(head, folded)
+	// 摘要变化后立即持久化：重启或断点续跑时可直接复用，不再重复付费摘要
+	if a.compaction.compactedCount > a.persistedCompaction {
+		a.persistCompaction(ctx)
+	}
 	if anchor != "" {
 		messages = append(messages, domainagent.ChatMessage{
 			Role:    session.RoleSystem,
@@ -305,19 +317,6 @@ func (a *Agent) renderTaskState() string {
 	}
 	sb.WriteString("</task_state>")
 	return sb.String()
-}
-
-// foldEntries 折叠过长的工具输出。
-func foldEntries(entries []domainagent.Entry, headRunes, tailRunes int) []domainagent.Entry {
-	folded := make([]domainagent.Entry, len(entries))
-	copy(folded, entries)
-	for i, entry := range folded {
-		if !entry.Kind.Foldable() {
-			continue
-		}
-		folded[i].Content = session.FoldToolResult(entry.Content, headRunes, tailRunes)
-	}
-	return folded
 }
 
 // compactRange 把一批消息并入摘要。

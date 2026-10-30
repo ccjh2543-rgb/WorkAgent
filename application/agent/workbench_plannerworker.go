@@ -148,7 +148,7 @@ func (a *Agent) startPW(ctx context.Context, task string, toolDescs []string, da
 	// 干净上下文（决策式状态机自身维护 worker 上下文，不依赖全局 memory）
 	a.memory.Replace(nil)
 	a.planner = planner.NewPlanner()
-	a.compaction.reset()
+	a.resetCompaction()
 	a.memBlock = ""
 
 	// 把评估工具以延迟工具注册进本体

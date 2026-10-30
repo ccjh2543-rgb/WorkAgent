@@ -329,7 +329,7 @@ func (a *Agent) pwMessages(wc *workerCtx) []domainagent.ChatMessage {
 		head = append(head, domainagent.ChatMessage{Role: session.RoleSystem, Content: "当前系统时间：" + wc.datetime})
 	}
 	head = append(head, domainagent.ChatMessage{Role: session.RoleUser, Content: "当前子任务：" + wc.instruction})
-	entries := foldEntries(wc.mem.Entries(), a.foldHeadRunes, a.foldTailRunes)
+	entries := a.foldEntries(wc.mem.Entries())
 	messages := make([]domainagent.ChatMessage, 0, len(head)+len(entries))
 	messages = append(messages, head...)
 	for _, e := range entries {
@@ -345,7 +345,7 @@ func (a *Agent) trimWorkerMemory(ctx context.Context, wc *workerCtx) {
 	if wc.noTrim {
 		return
 	}
-	entries := foldEntries(wc.mem.Entries(), a.foldHeadRunes, a.foldTailRunes)
+	entries := a.foldEntries(wc.mem.Entries())
 	var kept []domainagent.Entry
 	used := 0
 	for i := len(entries) - 1; i >= 0; i-- {

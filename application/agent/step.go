@@ -437,7 +437,7 @@ func (a *Agent) appendEntry(ctx context.Context, entry domainagent.Entry) {
 
 // restoreHistory 从会话库恢复当前分支的历史到上下文。
 func (a *Agent) restoreHistory(ctx context.Context) error {
-	a.compaction.reset()
+	a.resetCompaction()
 	if a.sessStore == nil {
 		return nil
 	}
@@ -446,7 +446,15 @@ func (a *Agent) restoreHistory(ctx context.Context) error {
 		return err
 	}
 	trimmed := session.TrimHistory(messages, a.maxHistoryRunes)
-	a.memory.Replace(domainagent.ToEntries(trimmed))
+	entries, summary := restoreCompaction(trimmed)
+	a.memory.Replace(entries)
+	// 恢复的摘要只覆盖窗口之外的消息，窗口内条目均未被覆盖，因此计数归零。
+	// 这样下一次压缩会从窗口起点继续并入摘要，而不是重复覆盖。
+	if summary != "" {
+		a.compaction.summary = summary
+		a.compaction.compactedCount = 0
+	}
+	a.persistedCompaction = a.compaction.compactedCount
 	if len(trimmed) > 0 {
 		fmt.Printf("[已恢复会话 %s 的 %d 条历史消息]\n", a.sessionID, len(trimmed))
 	}

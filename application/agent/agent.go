@@ -76,6 +76,9 @@ type Agent struct {
 	savedFoldTail int
 	// compaction 上下文压缩的内存缓存，回滚或历史被替换时必须失效
 	compaction compactionState
+	// persistedCompaction 已持久化到会话树的压缩覆盖条数，
+	// 用于避免同一范围内每轮重复写入压缩记录
+	persistedCompaction int
 	// metrics 上下文压缩/折叠/裁剪的可观测计数（判断窗口阈值是否合理）
 	metrics AgentMetrics
 	// contextReport 最近一次上下文装配的分区用量快照。
@@ -109,7 +112,9 @@ type Agent struct {
 	memBlock string                 // 本轮检索得到的记忆块，由 prepareContext 注入
 	// workspace 文件工具可访问的目录范围，nil 表示文件工具不可用
 	workspace *tools.Workspace
-	closers   []io.Closer // 退出时需要关闭的资源（记忆索引、会话库）
+	// stateDir 运行状态根目录（会话库、记忆索引、工具输出留存）
+	stateDir string
+	closers  []io.Closer // 退出时需要关闭的资源（记忆索引、会话库）
 
 	// nativeTools 注入的模型端口是否支持原生 tool calling。
 	// 装配时按端口能力一次性确定：支持则在每次请求里声明工具（toolDecls），
@@ -257,8 +262,15 @@ func NewAgentWithOptions(chatModel domainagent.ChatModel, opts Options) *Agent {
 		agent.initFileTools(projectDir, opts.PathAllow, opts.Audit)
 	}
 	if stateDir != "" {
+		agent.stateDir = stateDir
 		agent.initMemory(stateDir)
 		agent.initSession(stateDir)
+		// 折叠工具输出时会把原文留存到状态目录，这里注册只读回取工具。
+		// 目录按当前会话动态计算，切换会话后自动收紧到新会话的留存范围。
+		agent.toolReg.RegisterWithPolicy(tools.NewToolOutputReader(agent.toolOutputDir), tool.ToolPolicy{
+			Risk:        tool.RiskReadOnly,
+			AutoApprove: true,
+		})
 	}
 
 	// 工具列表必须在所有工具注册完成之后才渲染。
@@ -386,7 +398,7 @@ func (a *Agent) renderSystemPrompt() {
 	}
 	a.systemPrompt = strings.ReplaceAll(a.sysTemplate, "{{TOOL_LIST}}", a.toolReg.GetAllToolsDescFiltered(allowed))
 	a.toolDecls = a.buildToolDecls(allowed)
-	a.compaction.reset()
+	a.resetCompaction()
 }
 
 // buildToolDecls 收集可声明给模型的原生工具。
@@ -449,7 +461,7 @@ func (a *Agent) SetOnEvent(fn func(domainagent.AgentEvent)) {
 func (a *Agent) SetTokenizer(t domainagent.Tokenizer) {
 	a.tokenizer = t
 	// 计数口径变化会影响预算判断，失效已做的压缩缓存
-	a.compaction.reset()
+	a.resetCompaction()
 }
 
 // SetContextBudget 覆盖单次请求的上下文预算（估算 token）。
@@ -464,7 +476,7 @@ func (a *Agent) SetContextBudget(tokens int) {
 		tokens = minContextBudget
 	}
 	a.contextBudget = tokens
-	a.compaction.reset()
+	a.resetCompaction()
 }
 
 // ContextSnapshot 返回最近一次上下文装配的分区用量快照；尚未装配时返回 nil。
@@ -582,6 +594,8 @@ func (a *Agent) initFileTools(projectDir string, pathAllow []string, auditLog *a
 		"read_docx":    true,
 		"read_pptx":    true,
 		"read_pdf":     true,
+		// 折叠工具输出的回取工具同样在进程内执行，不交给外部 harness
+		"read_tool_output": true,
 	}
 	writeTool := tools.NewWriteFileTool(workspace)
 	writeTool.SetAudit(auditLog)
@@ -723,11 +737,23 @@ func (a *Agent) ListBranches(ctx context.Context, sessionID string) ([]session.B
 }
 
 // LoadHistory 读取指定会话当前分支的完整历史，供人工挑选回滚点。
+// 压缩记录属于内部元数据，不作为消息展示给用户，也不参与回滚点选择。
 func (a *Agent) LoadHistory(ctx context.Context, sessionID string) ([]session.Message, error) {
 	if a.sessStore == nil {
 		return nil, errors.New("会话持久化未启用，无法读取历史")
 	}
-	return a.sessStore.LoadBranch(ctx, sessionID, 0)
+	messages, err := a.sessStore.LoadBranch(ctx, sessionID, 0)
+	if err != nil {
+		return nil, err
+	}
+	visible := make([]session.Message, 0, len(messages))
+	for _, message := range messages {
+		if message.Kind == session.KindCompaction {
+			continue
+		}
+		visible = append(visible, message)
+	}
+	return visible, nil
 }
 
 // cleanupExpiredSessions 删除超过保留期的会话
